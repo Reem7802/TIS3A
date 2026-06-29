@@ -1,0 +1,42 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+
+# Trained models — too large for git, keep local only
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Whisper cache
+.cache/
+
+# Audio recordings — customer call data, do not commit
+backend/voices/recordings/
+backend/voices/calls/
+*.wav
+*.webm
+!backend/voices/reference_ar.wav
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# OS / editor
+.DS_Store
+.vscode/
+*.log
+
+# Env vars / secrets
+.env.local
+.env
