@@ -394,3 +394,14 @@ def build_question(intent: str, question_idx: int, emotion: str) -> str:
     ack = get_emotion_ack(emotion) if question_idx == 0 else ""
     q   = get_question(intent, question_idx)
     return ack + q
+
+# ── Gathering responses (when message is too short to classify) ───────────────
+GATHERING = [
+    "وش المشكلة بالتحديد؟",
+    "خبرني أكثر، وش اللي صار؟",
+    "تفضل، وش عندك؟",
+    "أخبرني بالتفاصيل، وش صار معك؟",
+]
+
+def get_gathering() -> str:
+    return random.choice(GATHERING)

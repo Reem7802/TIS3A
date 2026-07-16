@@ -14,7 +14,7 @@ from core.classifier import analyze_text
 from core.flow_engine import get_flow, apply_emotion_boost, ACTION_AR
 from core.database import save_call
 from core.responses import (
-    get_greeting, build_question, get_confirm_question,
+    get_greeting, get_gathering, build_question, get_confirm_question,
     get_counter_offer, get_yes_response, get_counter_yes_response,
     get_final_no, get_out_of_scope, get_unclear,
 )
@@ -52,6 +52,8 @@ QUESTION_SUBSTRINGS = [
     "مافيه","ماعندك","ماعندكم","فيه حل","ممكن حل","يمكن حل",
     "فيه بديل","فيه خيار","حل ثاني","بديل ثاني","خيار ثاني",
     "غير كذا","بدل كذا","وش يصير","ايش يصير","كيف يصير",
+    "فيه شي ثاني","فيه طريقه","فيه طريقة","ما فيه","مافي غير",
+    "فيه حل ثاني","فيه بديل ثاني","غير هذا","ما عندك غير",
 ]
 
 # Out-of-scope keywords — not banking emergency
@@ -70,6 +72,10 @@ def parse_yes_no(text: str) -> str:
     words   = set(cleaned.split())
 
     if text.strip().endswith("؟") or text.strip().endswith("?"):
+        return "question"
+
+    # Multiple ? = frustrated customer asking a question
+    if text.count("؟") > 1 or text.count("?") > 1:
         return "question"
 
     for sub in QUESTION_SUBSTRINGS:
@@ -130,6 +136,36 @@ def _record_turn(session, customer_text, assistant_text):
     session.setdefault("assistant_turns", []).append(assistant_text)
     session.setdefault("transcript_turns",[]).append(customer_text)
 
+
+# ── Smart classification threshold ───────────────────────────────────────────
+def _should_classify(text: str, analysis: dict) -> bool:
+    """
+    Decide if we have enough signal to classify and start the flow.
+    Returns False if the message is too vague — system will ask for more info.
+    """
+    words = text.strip().split()
+    confidence = analysis.get("intent_confidence", 0)
+    intent = analysis.get("intent", "")
+
+    # Always classify if message is long enough (5+ words with clear content)
+    if len(words) >= 5 and confidence >= 0.70:
+        return True
+
+    # Always classify high-confidence even on short messages
+    if confidence >= 0.88:
+        return True
+
+    # Very short messages with low confidence — need more info
+    if len(words) <= 3 and confidence < 0.80:
+        return False
+
+    # Medium length with decent confidence
+    if len(words) >= 4 and confidence >= 0.75:
+        return True
+
+    return False
+
+
 # ── POST /conversation/start ───────────────────────────────────────────────────
 @router.post("/start")
 async def start_conversation(req: StartInput):
@@ -157,12 +193,42 @@ async def start_conversation(req: StartInput):
         }
         return {"session_id":session_id,"is_greeting":True,"message":msg,"done":False}
 
-    analysis = analyze_text(req.text)
-    intent   = analysis["intent"]
-    emotion  = analysis["emotion"]
-    flow     = get_flow(intent)
-    session  = _new_session(req.channel, req.text, analysis, flow)
-    priority = session["priority"]
+    # Check if we have a pending gathering session (customer sent short message before)
+    existing = sessions.get(session_id)
+
+    if existing and existing.get("gathering"):
+        # Customer sent more info after we asked — classify ONLY the new message
+        # The first message was too vague, ignore it for classification
+        analysis = analyze_text(req.text)
+        intent   = analysis["intent"]
+        emotion  = analysis["emotion"]
+        # If STILL unclear, classify anyway — we already asked once
+        flow     = get_flow(intent)
+        session  = _new_session(req.channel, req.text, analysis, flow)
+        session["customer_text"] = req.text
+        priority = session["priority"]
+    else:
+        # Fresh start — classify the current message
+        analysis = analyze_text(req.text)
+        intent   = analysis["intent"]
+        emotion  = analysis["emotion"]
+
+        # Check if we have enough signal to classify
+        if not _should_classify(req.text, analysis):
+            # Not enough info — ask for more details (only ask once)
+            msg = get_gathering()
+            sessions[session_id] = {
+                "channel":req.channel,"customer_text":req.text,"analysis":analysis,
+                "intent":"","emotion":emotion,"priority":"LOW",
+                "questions":[],"answers":[],"negotiation_stage":"main","question_idx":0,
+                "customer_turns":[req.text],"assistant_turns":[msg],"transcript_turns":[req.text],
+                "gathering": True,
+            }
+            return {"session_id":session_id,"is_greeting":True,"message":msg,"done":False}
+
+        flow     = get_flow(intent)
+        session  = _new_session(req.channel, req.text, analysis, flow)
+        priority = session["priority"]
     has_q    = bool(flow and flow.questions)
 
     if has_q:
@@ -197,12 +263,23 @@ async def process_answer(req: AnswerInput):
     if not session:
         return {"error":"session not found","done":True}
 
+    flow    = get_flow(session["intent"])
+    intent  = session["intent"]
+    emotion = session["emotion"]
+
+    # If customer is asking a question instead of answering — repeat current question
+    if parse_yes_no(req.text) == "question":
+        current_idx = req.question_idx
+        msg = build_question(intent, current_idx, emotion)
+        _record_turn(session, req.text, msg)
+        return {
+            "message":msg,"question_idx":current_idx,
+            "answers":session.get("answers",[]),"ready_to_confirm":False,"done":False
+        }
+
     session["answers"] = session.get("answers",[]) + [req.text]
     answers  = session["answers"]
     next_idx = req.question_idx + 1
-    flow     = get_flow(session["intent"])
-    intent   = session["intent"]
-    emotion  = session["emotion"]
 
     if flow and next_idx < len(flow.questions):
         msg = build_question(intent, next_idx, emotion)
