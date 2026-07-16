@@ -115,17 +115,37 @@ export default function CustomerPage() {
   const startRec = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio:true })
-      const mr = new MediaRecorder(stream, { mimeType:'audio/webm' })
+
+      // Pick a mimeType the browser actually supports — 'audio/webm' isn't
+      // guaranteed on every Chrome/Linux build, so we probe first.
+      const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', '']
+      const supported = candidates.find(t => t === '' || MediaRecorder.isTypeSupported(t))
+      console.log('[تسعة] Using mimeType:', supported || '(browser default)')
+
+      const mr = supported ? new MediaRecorder(stream, { mimeType: supported }) : new MediaRecorder(stream)
       chunksRef.current = []
       mr.ondataavailable = e => { if (e.data.size>0) chunksRef.current.push(e.data) }
+      mr.onerror = (e) => console.error('[تسعة] MediaRecorder error:', e)
       mr.start(200)
       mediaRef.current = mr
-    } catch { setPhase('error') }
+      console.log('[تسعة] Recording started, state:', mr.state)
+    } catch (err) {
+      console.error('[تسعة] startRec failed:', err)
+      setPhase('error')
+    }
   }, [])
 
   const stopRec = useCallback((): Promise<Blob> => new Promise(resolve => {
-    if (!mediaRef.current || mediaRef.current.state !== 'recording') { resolve(new Blob([])); return }
-    mediaRef.current.onstop = () => resolve(new Blob(chunksRef.current, { type:'audio/webm' }))
+    if (!mediaRef.current || mediaRef.current.state !== 'recording') {
+      console.warn('[تسعة] stopRec called but recorder not in "recording" state:', mediaRef.current?.state)
+      resolve(new Blob([])); return
+    }
+    const mimeType = mediaRef.current.mimeType || 'audio/webm'
+    mediaRef.current.onstop = () => {
+      const blob = new Blob(chunksRef.current, { type: mimeType })
+      console.log('[تسعة] Recording stopped, blob size:', blob.size, 'bytes, type:', mimeType)
+      resolve(blob)
+    }
     mediaRef.current.stop()
     mediaRef.current.stream?.getTracks().forEach(t => t.stop())
   }), [])
@@ -139,12 +159,27 @@ export default function CustomerPage() {
     }
     setPhase('analyzing'); setOrbMode('analyzing')
     const blob = await stopRec()
-    if (blob.size < 400) return ''
-    const form = new FormData()
-    form.append('file', blob, 'audio.webm')
-    const res = await fetch(`${API}/analyze`, { method:'POST', body:form })
-    const data = await res.json()
-    return data.transcript || ''
+    if (blob.size < 400) {
+      console.warn('[تسعة] Blob too small (', blob.size, 'bytes) — treating as no speech detected')
+      return ''
+    }
+    try {
+      const form = new FormData()
+      const ext = blob.type.includes('ogg') ? 'ogg' : 'webm'
+      form.append('file', blob, `audio.${ext}`)
+      const res = await fetch(`${API}/analyze`, { method:'POST', body:form })
+      if (!res.ok) {
+        const errText = await res.text()
+        console.error('[تسعة] /analyze returned', res.status, errText)
+        throw new Error(`analyze failed: ${res.status}`)
+      }
+      const data = await res.json()
+      console.log('[تسعة] Transcript received:', data.transcript)
+      return data.transcript || ''
+    } catch (err) {
+      console.error('[تسعة] getCustomerText (voice) failed:', err)
+      throw err
+    }
   }, [channel, textInput, stopRec])
 
   // ── Submit handler — works for all 3 stages ───────────────────────────────
@@ -209,11 +244,23 @@ export default function CustomerPage() {
         })
         const d = await res.json()
         addMsg('assistant', d.message)
+
+        if (d.done === false && d.negotiation_round === 'counter_offer') {
+          // Customer said no to the main offer — AI is now negotiating.
+          // Stay in 'confirm' stage (backend tracks negotiation_stage in session),
+          // just speak the counter-offer and listen for the second yes/no.
+          doSpeak(d.message, () => { setPhase('listening'); setOrbMode(isCritical?'critical':'listening'); if(channel==='voice') startRec() })
+          return
+        }
+
         setTicketNo(d.ticket_number || '')
         setFinalStatus(d.status || '')
         doSpeak(d.message, () => { setPhase('done'); setOrbMode('idle') })
       }
-    } catch { setPhase('error') }
+    } catch (err) {
+      console.error('[تسعة] handleSubmit failed at stage:', stage, err)
+      setPhase('error')
+    }
   }, [stage, sessionId, questionIdx, answers, channel, isCritical, getCustomerText, doSpeak])
 
   const resetAll = useCallback(() => {
@@ -232,7 +279,7 @@ export default function CustomerPage() {
         <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1"/>
       </Head>
 
-      <div style={{ minHeight:'100vh', background:'var(--c-bg)', display:'flex', flexDirection:'column', maxWidth:430, margin:'0 auto' }}>
+      <div style={{ height:'100vh', background:'var(--c-bg)', display:'flex', flexDirection:'column', maxWidth:430, margin:'0 auto', overflow:'hidden' }}>
 
         {/* Header */}
         <div style={{ padding:'18px 20px', display:'flex', alignItems:'center', justifyContent:'space-between', borderBottom:'1px solid var(--c-border)' }}>
@@ -273,13 +320,15 @@ export default function CustomerPage() {
         {/* Active conversation */}
         {phase !== 'idle' && (
           <>
-            <div ref={chatRef} style={{ flex:1, overflowY:'auto', padding:'18px 16px', display:'flex', flexDirection:'column', gap:14 }}>
+            <div ref={chatRef} style={{ flex:1, overflowY:'auto', padding:'18px 16px', display:'flex', flexDirection:'column', gap:14, minHeight:0 }}>
               {messages.map((m,i) => <Bubble key={i} role={m.role} text={m.text}/>)}
               {(phase === 'analyzing' || phase === 'greeting' || phase === 'speaking') && (
                 <div style={{ display:'flex', justifyContent:'center', padding:'10px 0' }}>
                   <VoiceOrb mode={orbMode}/>
                 </div>
               )}
+              {/* Scroll anchor */}
+              <div style={{ height:1, flexShrink:0 }}/>
             </div>
 
             <div style={{ borderTop:'1px solid var(--c-border)', padding:'16px 18px 28px', flexShrink:0 }}>
